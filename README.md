@@ -36,6 +36,10 @@
 | `tools/` | 本地工具链环境脚本 |
 | `scripts/` | 构建、安装、无线 ADB 辅助脚本 |
 
+## 下载
+
+当前版本：[`v1.3.0`](https://github.com/MinadukiTouka/th01/releases/tag/v1.3.0)（`th01-1.3.0-android-apk.apk`，`versionCode 10031`）。
+
 ## 构建
 
 本仓库**不包含**原版游戏数据、字体、BGM/SE，也不包含 APK 和签名文件。构建前需要：
