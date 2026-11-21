@@ -1,0 +1,879 @@
+// High-level overview of the differences between the three games that can't be
+// easily abstracted away:
+//
+// 2) TH03 types text onto VRAM page 0, with a delay after each glyph. TH04 and
+//    TH05 render all text onto VRAM page 1 (the invisible one) without any
+//    delay, and then fade the new text onto page 0 during box_1_to_0_animate().
+// 3) TH03 and TH04 unblit the text of the previous box when starting a new
+//    one, from all VRAM pages they rendered to. TH05 leaves the text of the
+//    previous box on the visible VRAM page 0.
+
+#pragma option -zPgroup_01
+
+#include <stddef.h>
+#include "game/bgimage.hpp"
+#include "game/cutscene.hpp"
+#include "libs/master.lib/master.hpp"
+#include "libs/master.lib/pc98_gfx.hpp"
+#include "th02/v_colors.hpp"
+#include "th02/hardware/frmdelay.h"
+#include "th03/sprites/pi_mask.hpp"
+#if (GAME == 5)
+#include "th05/hardware/input.h"
+#elif (GAME == 4)
+#include "th04/hardware/input.h"
+#else
+#include "th03/hardware/input.h"
+
+// Let's rather not have this one global, since it might be wrong in an in-game
+// context?
+#define key_det input_sp
+#endif
+#if (GAME == 5)
+#include "th04/hardware/grppsafx.h"
+#include "th04/snd/snd.h"
+#include "th04/gaiji/gaiji.h"
+#elif (GAME == 4)
+#include "th04/hardware/grppsafx.h"
+#include "th04/snd/snd.h"
+#else
+#include "th01/hardware/grppsafx.h"
+#include "th03/snd/snd.h"
+#endif
+#include "th03/cutscene/cutscene.hpp"
+
+// Constants
+// ---------
+
+static const screen_y_t CUTSCENE_PIC_TOP = 64;
+static const int CUTSCENE_PIC_SLOT = 0;
+
+// Note that this does not correspond to the tiled area painted into TH05's
+// EDBK?.PI images.
+static const screen_x_t BOX_LEFT = 80;
+static const screen_y_t BOX_TOP = 320;
+static const pixel_t BOX_W = 480;
+static const pixel_t BOX_H = (GLYPH_H * 4);
+
+static const screen_x_t BOX_RIGHT = (BOX_LEFT + BOX_W);
+static const screen_y_t BOX_BOTTOM = (BOX_TOP + BOX_H);
+
+#if (GAME == 5)
+static const screen_x_t RETURN_LEFT = (BOX_RIGHT + GLYPH_FULL_W);
+static const screen_x_t RETURN_RIGHT = (RETURN_LEFT + GLYPH_FULL_W);
+#endif
+
+static const LTWH<upixel_t> BOX_REGION = {
+	BOX_LEFT,
+	BOX_TOP,
+#if (GAME == 5)
+	(RETURN_RIGHT - BOX_LEFT),
+	(BOX_H + GLYPH_H),
+#else
+	BOX_W,
+	BOX_H,
+#endif
+};
+
+static const shiftjis_ank_amount_t NAME_LEN = 6;
+static const shiftjis_kanji_amount_t NAME_KANJI_LEN = (
+	NAME_LEN / sizeof(shiftjis_kanji_t)
+);
+
+// Adding a fullwidth colon after the name
+static const pixel_t NAME_W = ((NAME_LEN * GLYPH_HALF_W) + GLYPH_FULL_W);
+
+static const int TEXT_INTERVAL_DEFAULT = ((GAME == 5) ? 2 : 1);
+// ---------
+
+/// State
+/// -----
+
+#if (GAME == 5)
+#define extern
+#endif
+
+// Dynamically allocated.
+extern unsigned char far *script;
+
+#define script_p script
+
+GrpSurface_M4 box_bg;
+Palette8 palette_from_last_pi_loaded;
+
+// Skips any delays during the cutscene if `true`.
+extern bool fast_forward;
+
+#if (GAME == 5)
+// String-to-color map
+// -------------------
+// Used to automatically change the text color whenever a specific Shift-JIS
+// code point is encountered.
+
+static const int COLMAP_COUNT = 8;
+
+struct colmap_t {
+	vc_t values[COLMAP_COUNT];
+
+	// Might have been originally meant for a complete character name?
+	ShiftJISKanji keys[COLMAP_COUNT][NAME_KANJI_LEN];
+};
+
+colmap_t colmap;
+#undef extern
+extern unsigned char colmap_count;
+#define extern
+/// -------------------
+#endif
+
+// [y] is always aligned to GLYPH_H pixels.
+extern screen_point_t cursor;
+
+extern int text_interval;
+extern vc_t text_col;
+extern uint8_t text_fx; // TH04 and TH05 directly set [graph_putsa_fx_func].
+
+#if (GAME >= 4)
+#define text_fx graph_putsa_fx_func
+#endif
+// -----
+
+// Function ordering fails
+// -----------------------
+
+#if (GAME == 5)
+// Waits the given amount of frames (0 = forever) for the OK, Shot, or Cancel
+// button to be pressed, while showing the ⏎ Return key animation in a blocking
+// way.
+void pascal near box_wait_animate(int frames_to_wait = 0);
+#else
+#define box_wait_animate(frames_to_wait) { \
+	input_wait_for_change(frames_to_wait); \
+}
+#endif
+#if (GAME >= 4)
+// Crossfades the text box area from VRAM page 1 to VRAM page 0, spending
+// [text_interval] frames on each step.
+void near box_1_to_0_animate(void);
+#endif
+// -----------------------
+
+// Same game-specific branches as in the Music Room, but they have a much
+// bigger impact here:
+//
+// ZUN quirk: The cutscene system features both
+// 1) a top-level input sensing mechanism (for updating the fast-forward flag),
+//    and
+// 2) nested, blocking input loops (during all the interruptable wait commands)
+//    which are skipped based on the fast-forward flag.
+// With this combination, the accurate detection of held keys matters: Since
+// this function is only called once on every iteration of the loop before
+// evaluating a command, a momentary key release scancode from 1) can cause 2)
+// to be entered even if the fast-forward key is still being held. Only TH03's
+// and TH05's input functions defend against this possibility – at the cost of
+// 614.4 µs for every call to them. TH04's cutscene system does suffer from the
+// detection issue, but runs significantly faster in exchange, as it's not
+// slowed down on every iteration of the script interpreter loop, i.e., between
+// every script command or 2-byte text pair.
+inline void cutscene_input_sense(void) {
+#if (GAME == 5)
+	input_reset_sense_held();
+#elif (GAME == 4)
+	input_reset_sense();
+#elif (GAME == 3)
+	input_mode_interface();
+#endif
+}
+
+bool16 pascal near cutscene_script_load(const char* fn)
+{
+	cutscene_script_free();
+
+	if(!file_ropen(fn)) {
+		return true;
+	}
+	size_t size = file_size();
+	script = reinterpret_cast<unsigned char far *>(hmem_allocbyte(size));
+	file_read(script_p, size);
+	file_close();
+	return false;
+}
+
+void near cutscene_script_free(void)
+{
+	if(script) {
+		HMem<unsigned char>::free(script);
+		script = nullptr;
+	}
+}
+
+void near box_bg_put(void)
+{
+	box_bg.write(BOX_LEFT, BOX_TOP);
+}
+
+void near box_bg_snap(void)
+{
+	box_bg.snap(0, 0, &BOX_REGION);
+}
+
+#undef extern
+#include "th03/formats/script.hpp"
+
+void near cursor_advance_and_animate(void)
+{
+	cursor.x += GLYPH_FULL_W;
+	if(cursor.x >= BOX_RIGHT) {
+		cursor.y += GLYPH_H;
+		cursor.x = (BOX_LEFT + NAME_W);
+
+		if(cursor.y >= BOX_BOTTOM) {
+#if (GAME >= 4)
+			box_1_to_0_animate();
+#endif
+
+			// ZUN quirk: Since [cursor.y] is >= BOX_BOTTOM here, the TH05
+			// Return key animation will be displayed at the right edge of the
+			// "5th" line, below BOX_BOTTOM.
+			// (Same issue as with the \n command.)
+			if(!fast_forward) {
+				box_wait_animate(0);
+			}
+
+			// Unconditionally moving the cursor into the name area? This is
+			// not what a script author would expect, especially with automatic
+			// line breaks doing the opposite. If you are forced to write your
+			// script in a way that anticipates such a cursor move, you might
+			// as well explicitly add the necessary text box change commands
+			// manually.
+			cursor.x = BOX_LEFT;
+			cursor.y = BOX_TOP;
+
+			// ZUN landmine: The \s command is the only place in TH05 where text
+			// is unblitted from any page. Not doing it here completely breaks
+			// automatically added text boxes in that game, as any new text
+			// will just be blitted on top of old text.
+			// (Not that the feature would have been particularly usable
+			// without this bug, thanks to the assignments above…)
+#if (GAME == 4)
+			graph_accesspage(1);	box_bg_put();
+			graph_accesspage(0);	box_bg_put();
+#elif (GAME == 3)
+			graph_accesspage(0);	box_bg_put();
+#endif
+		}
+	}
+}
+
+#if (GAME >= 4)
+#include "th01/hardware/egc_impl.hpp"
+
+typedef enum {
+	BOX_MASK_0,
+	BOX_MASK_1,
+	BOX_MASK_2,
+	BOX_MASK_3,
+	BOX_MASK_COPY,
+	BOX_MASK_COUNT,
+
+	_box_mask_t_FORCE_UINT16 = 0xFFFF
+} box_mask_t;
+
+// Copies the text box area from VRAM page 1 to VRAM page 0, applying the
+// given [mask]. Assumes that the EGC is active, and initialized for a copy.
+void pascal near box_1_to_0_masked(box_mask_t mask)
+{
+	extern const dot_rect_t(16, 4) BOX_MASKS[BOX_MASK_COUNT];
+	egc_temp_t tmp;
+
+	for(screen_y_t y = BOX_TOP; y < BOX_BOTTOM; y++) {
+		outport(EGC_MASKREG, BOX_MASKS[mask][y & 3]);
+
+		vram_offset_t vram_offset = vram_offset_shift(BOX_LEFT, y);
+		pixel_t x = 0;
+		while(x < BOX_W) {
+			graph_accesspage(1);	tmp = egc_chunk(vram_offset);
+			graph_accesspage(0);	egc_chunk(vram_offset) = tmp;
+			x += EGC_REGISTER_DOTS;
+			vram_offset += EGC_REGISTER_SIZE;
+		}
+	}
+}
+
+void near box_1_to_0_animate(void)
+{
+	egc_on();
+	egc_setup_copy();
+	if(!fast_forward) {
+		for(int i = BOX_MASK_0; i < BOX_MASK_COPY; i++) {
+			box_1_to_0_masked(static_cast<box_mask_t>(i));
+			frame_delay(text_interval);
+		}
+	}
+	box_1_to_0_masked(BOX_MASK_COPY);
+	egc_off();
+
+#if (GAME == 5)
+	frame_delay(1); // ZUN quirk
+#endif
+}
+#endif
+
+#if (GAME == 5)
+void pascal near box_wait_animate(int frames_to_wait)
+{
+	unsigned int frame = 0;
+	bool16 ignore_frames = false;
+
+	while(1) {
+		cutscene_input_sense();
+		if(key_det == INPUT_NONE) {
+			break;
+		}
+		frame_delay(1);
+	}
+
+	if(frames_to_wait == 0) {
+		frames_to_wait = 999;
+		ignore_frames = true;
+	}
+
+	graph_accesspage(0);
+	while(1) {
+		static LTWH<upixel_t> return_region = {
+			(RETURN_LEFT - BOX_LEFT), 0, GLYPH_FULL_W, GLYPH_H
+		};
+		return_region.top = (cursor.y - BOX_TOP);
+		cutscene_input_sense();
+
+		// ZUN bloat: A white glyph aligned to the 8×16 cell grid, without
+		// applying boldface… why not just show it on TRAM?
+		box_bg.write(RETURN_LEFT, cursor.y, &return_region);
+
+		if(
+			(frames_to_wait <= 0) ||
+			(key_det & (INPUT_OK | INPUT_SHOT | INPUT_CANCEL))
+		) {
+			return;
+		}
+		graph_gaiji_putc(
+			RETURN_LEFT,
+			cursor.y,
+			(ga_RETURN_KEY + ((frame / 8) % RETURN_KEY_CELS)),
+			V_WHITE
+		);
+		frame++;
+		if(!ignore_frames) {
+			frames_to_wait--;
+		}
+		frame_delay(1);
+	}
+}
+#endif
+
+// Called with [script_p] at the character past [c].
+script_ret_t pascal near script_op(unsigned char c)
+{
+	int i;
+	int p1;
+	int p2;
+
+	// ZUN bloat: PF_FN_LEN on its own is enough, it already includes the \0
+	// terminator.
+	char fn[PF_FN_LEN + 3];
+
+	c = tolower(c);
+	switch(c) {
+	case 'n':
+		cursor.y += GLYPH_H;
+		cursor.x = BOX_LEFT;
+		if(cursor.y < BOX_BOTTOM) {
+			break;
+		}
+		// ZUN quirk: Since [cursor.y] is >= BOX_BOTTOM here, the TH05 Return
+		// key animation will be displayed at the right edge of the "5th" line,
+		// below BOX_BOTTOM. (Same issue as in cursor_advance_and_animate().)
+
+		// fallthrough to \s if this box is full
+
+	case 's':
+		c = *script_p;
+#if (GAME >= 4)
+		box_1_to_0_animate();
+#endif
+		if(c != '-') {
+			script_param_read_number_first(p1, 0);
+			if(!fast_forward) {
+				box_wait_animate(p1);
+			}
+		} else {
+			script_p++;
+		}
+		cursor.x = BOX_LEFT;
+		cursor.y = BOX_TOP;
+
+		// High-level overview, point 2)
+#if (GAME >= 4)
+		graph_accesspage(1);	box_bg_put();
+#endif
+#if (GAME <= 4)
+		graph_accesspage(0);	box_bg_put();
+#endif
+		break;
+
+	case 'c':
+#if (GAME == 5)
+		if(*script_p == '=') {
+			goto colmap_add;
+		}
+#endif
+		script_param_read_number_first(p1, V_WHITE);
+		text_col = p1;
+		break;
+
+	case 'b':
+		script_param_read_number_first(p1, WEIGHT_BOLD);
+#if (GAME >= 4)
+		graph_putsa_fx_func = static_cast<graph_putsa_fx_func_t>(p1);
+#else
+		switch(p1) {
+		case WEIGHT_NORMAL:	text_fx = FX_WEIGHT_NORMAL;	break;
+		case WEIGHT_HEAVY: 	text_fx = FX_WEIGHT_HEAVY; 	break;
+		case WEIGHT_BOLD:  	text_fx = FX_WEIGHT_BOLD;  	break;
+		case WEIGHT_BLACK: 	text_fx = FX_WEIGHT_BLACK; 	break;
+		}
+#endif
+		break;
+
+	case 'w':
+		c = tolower(*script_p);
+		if((c == 'o') || (c == 'i')) {
+			script_op_fade(c, palette_white_in, palette_white_out, p1);
+		} else {
+#if (GAME >= 4)
+			box_1_to_0_animate();
+#endif
+			script_param_number_default = 64;
+			if(c != 'm') {
+				if(c == 'k') {
+					script_p++;
+				}
+				script_param_read_number_first(p1);
+				if(!fast_forward) {
+#if (GAME >= 4)
+					frame_delay(p1);
+#else
+					if(c != 'k')  {
+						frame_delay(p1);
+					} else {
+						input_wait_for_ok(p1);
+					}
+#endif
+				}
+			} else {
+				script_p++;
+				c = *script_p;
+				if(c == 'k') {
+					script_p++;
+				}
+				script_param_read_number_first(p1);
+				script_param_read_number_second(p2);
+				if(!fast_forward) {
+					// ZUN landmine: Does not prevent the potential deadlock
+					// issue with this function.
+#if (GAME >= 4)
+					snd_delay_until_measure(p1, p2);
+#else
+					if(c != 'k')  {
+						snd_delay_until_measure(p1, p2);
+					} else {
+						input_wait_for_ok_or_measure(p1, p2);
+					}
+#endif
+				}
+			}
+		}
+		break;
+
+	case 'v':
+		if(*script_p != 'p') {
+			script_param_read_number_first(p1, TEXT_INTERVAL_DEFAULT);
+			text_interval = p1;
+		} else {
+			script_p++;
+			script_param_read_number_first(p1, 0);
+			graph_showpage(p1);
+		}
+		break;
+
+	case 't':
+		script_param_read_number_first(p1, 100);
+		if(!fast_forward) {
+			frame_delay(1);
+		}
+		palette_settone(p1);
+		break;
+
+	case 'f':
+		c = *script_p;
+		if(c != 'm') {
+			if((c == 'i') || (c == 'o')) {
+				script_op_fade(c, palette_black_in, palette_black_out, p1);
+			}
+		} else {
+			script_p++;
+			script_param_read_number_first(p1, 1);
+
+			// ZUN landmine: Should restrict [p1] to 8 bits – otherwise, the
+			// parameter would overflow into the function and not make this a
+			// fade. (The regular snd_kaja_func() behaves this way.)
+			snd_kaja_interrupt((KAJA_SONG_FADE << 8) + p1);
+		}
+		break;
+
+	case 'g':
+		if((GAME == 5) || (*script_p != 'a')) {
+			script_op_shake(fast_forward, p2, p1);
+		} else {
+			script_p++;
+			script_param_read_number_first(p1, 0);
+
+			graph_accesspage((GAME >= 4) ? 1 : 0);
+#if (GAME >= 4)
+			// [text_fx] is also ignored here...
+			graph_gaiji_putc(cursor.x, cursor.y, p1, text_col);
+#else
+			// Looks like a ZUN bug, but actually works around the master.lib
+			// bug mentioned in the comment of this function, which ZUN only
+			// fixed for TH04 and TH05. In the original binary, the ASCII→digit
+			// conversion inside str_consume_up_to_3_digits() is done by ADDing
+			// a negative number, which causes the x86 carry flag to always be
+			// set when we get here and haven't fallen back onto the default
+			// value. Therefore, the bug will always add 1 onto the gaiji ID,
+			// which can be worked around by subtracting 1 before passing it as
+			// a parameter. Once graph_gaiji_putc() returns, the carry flag
+			// happens to be cleared, which is why the subtraction is not
+			// necessary for the call below to display the intended gaiji.
+			graph_gaiji_putc(cursor.x, cursor.y, (p1 - 1), text_col);
+#endif
+			// ZUN quirk: No [text_interval]-based delay in TH03.
+
+			cursor_advance_and_animate();
+		}
+		return CONTINUE;
+
+	case 'k':
+		// ZUN landmine: Should have also been done in TH04. Without this call,
+		// this command will wait on an invisible text box, and needs to be
+		// preceded by a \vp1 command to actually work as a mid-box pause.
+#if (GAME == 5)
+		box_1_to_0_animate();
+#endif
+
+		script_param_read_number_first(p1, 0);
+		if(!fast_forward) {
+			// ZUN quirk: This parameter is ignored in TH03. Labeling this as a
+			// quirk because the original TH03 scripts call this command with a
+			// non-0 parameter in 19 of 34 cases, suggesting that ZUN made the
+			// conscious decision to override these parameters with 0 later in
+			// development.
+			box_wait_animate((GAME >= 4) ? p1 : 0);
+		}
+		return CONTINUE;
+
+	case '@':
+		graph_accesspage(1);	graph_clear();
+		graph_accesspage(0);	graph_clear();
+#if (GAME == 5)
+		box_bg_snap();
+#else
+		// ZUN landmine: Missing a box_bg_snap() or equivalent call. Any future
+		// box_bg_put() call will still display the box area snapped from any
+		// previously displayed background image. This bug therefore
+		// effectively restricts usage of this command to either the beginning
+		// of a script (before the first background image is shown) or its end
+		// (after no more new text boxes are started).
+#endif
+		break;
+
+	case 'p':
+		c = *script_p;
+		script_p++;
+
+		// ZUN landmine: Blitting and palette changes will cause screen tearing
+		// if done outside of VBLANK. It shouldn't be the script's
+		// responsibility to prevent that.
+		if((c == '=') || (c == '@')) {
+			graph_accesspage(1);
+			if(c == '=') {
+				Palettes = palette_from_last_pi_loaded;
+				palette_show();
+			}
+			bgimage.write(0, 0);
+			graph_copy_page(0);
+			graph_accesspage(0);
+			box_bg_snap();
+		} else if(c == '-') {
+			bgimage.free();
+			return CONTINUE;
+		} else if(c == 'p') {
+			Palettes = palette_from_last_pi_loaded;
+			palette_show();
+			return CONTINUE;
+		} else if(c != ',') {
+			script_p--;
+		} else {
+			script_param_read_fn(fn, p1, c);
+			GrpSurface_LoadPI(bgimage, &palette_from_last_pi_loaded, fn);
+		}
+		break;
+
+	case '=':
+		script_param_number_default = CUTSCENE_QUARTER_COUNT;
+		c = *script_p;
+
+		// ZUN landmine: Same screen tearing issues here. TH05's frame_delay()
+		// call prevents them for immediate blitting, but not for crossfading.
+		graph_accesspage(0);
+		if(c != '=') {
+			script_param_read_number_first(p1);
+#if (GAME == 5)
+			frame_delay(1);
+#endif
+			if(p1 < CUTSCENE_QUARTER_COUNT) {
+				bgimage.write(
+					CUTSCENE_PIC_LEFT, CUTSCENE_PIC_TOP, &CUTSCENE_QUARTERS[p1]
+				);
+			} else {
+				grcg_setcolor(GC_RMW, 0);
+				grcg_boxfill_8(
+					CUTSCENE_PIC_LEFT,
+					CUTSCENE_PIC_TOP,
+					(CUTSCENE_PIC_LEFT + CUTSCENE_PIC_W - 1),
+					(CUTSCENE_PIC_TOP  + CUTSCENE_PIC_H - 1)
+				);
+				grcg_off();
+			}
+		} else {
+			script_p++;
+			script_param_read_number_first(p1);
+			script_param_number_default = 1;
+			script_param_read_number_second(p2);
+			for(i = 0; i < PI_MASK_COUNT; i++) {
+				bgimage.or_masked(
+					CUTSCENE_PIC_LEFT,
+					CUTSCENE_PIC_TOP,
+					PI_MASKS[i],
+					PI_MASK_H,
+					&CUTSCENE_QUARTERS[p1]
+				);
+				if(!fast_forward) {
+					frame_delay(p2);
+				}
+			}
+			bgimage.write(
+				CUTSCENE_PIC_LEFT, CUTSCENE_PIC_TOP, &CUTSCENE_QUARTERS[p1]
+			);
+#if (GAME == 5)
+			frame_delay(1); // ZUN quirk
+#endif
+		}
+		break;
+
+	case 'm':
+		// TH03 uses the TH02 version of snd_load(), and consequently does the
+		// right thing and stops any currently playing BGM before loading the
+		// new one. It wouldn't be necessary for TH04 and TH05, but hey, still
+		// doing it removes a potential implementation difference.
+		script_op_bgm(true, c, fn, p1);
+		break;
+
+	case 'e':
+		script_param_read_number_first(p1);
+		snd_se_play_force(p1);
+		break;
+
+#if (GAME == 5)
+colmap_add:
+	script_p++;
+	colmap.keys[colmap_count][0].byte[0] = *script_p;
+	script_p++;
+	colmap.keys[colmap_count][0].byte[1] = *script_p;
+
+	// ZUN landmine: Jumps over the additional comma separating the two
+	// parameters, and assumes it's always present. Come on!
+	// script_param_read_number_second() exists to handle exactly this
+	// situation in a cleaner way.
+	script_p += 2;
+
+	script_param_read_number_first(p1, V_WHITE);
+
+	// ZUN landmine: No bounds check
+	colmap.values[colmap_count] = p1;
+	colmap_count++;
+	break;
+#endif
+
+	case '$':
+		return STOP;
+	}
+	return CONTINUE;
+}
+
+void near cutscene_animate(void)
+{
+	extern ShiftJISKanji near CUTSCENE_KANJI[];
+
+	unsigned char c;
+	uint8_t speedup_cycle;
+
+	ShiftJISKanji& kanji = *CUTSCENE_KANJI;
+
+	cursor.x = BOX_LEFT;
+	cursor.y = BOX_TOP;
+	text_interval = TEXT_INTERVAL_DEFAULT;
+	text_col = V_WHITE;
+	text_fx = FX_WEIGHT_BOLD;
+
+#if (GAME == 3)
+	speedup_cycle = 0;
+#endif
+
+	graph_showpage(0);
+
+	box_bg.alloc(BOX_REGION.w, BOX_REGION.h);
+
+	// Necessary because scripts can (and do) show multiple text boxes on the
+	// initially black background.
+	// ZUN landmine: TH05 assumes that they don't, which is true for all
+	// scripts in the original game.
+#if (GAME != 5)
+	box_bg_snap();
+#endif
+
+	fast_forward = false;
+
+	while(1) {
+		cutscene_input_sense();
+		if(key_det & INPUT_CANCEL) {
+			fast_forward = true;
+		} else {
+			fast_forward = false;
+		}
+
+		// Same iteration code as in TH04's dialog system.
+		c = *(script_p++);
+		if(str_sep_control_or_space(c)) {
+			continue;
+		}
+
+		// Opcode?
+		if(c == '\\') {
+			c = *(script_p++);
+			if(script_op(c) == STOP) {
+				break;
+			}
+			continue;
+		}
+
+#if (GAME == 5)
+		if(c == '@') {
+			int gaiji;
+			c = tolower(*script_p);
+			script_p++;
+			switch(c) {
+			case 't':
+				gaiji = gs_SWEAT;
+				break;
+
+			case 'h':
+				gaiji = gs_HEART_2;
+				break;
+
+			case '?':
+				gaiji = gs_QUESTION;
+				break;
+
+			case '!':
+				c = *(script_p++);
+				switch(c) {
+				case '!':
+					gaiji = gs_DOUBLE_EXCLAMATION;
+					break;
+
+				case '?':
+					gaiji = gs_EXCLAMATION_QUESTION;
+					break;
+
+				default:
+					script_p--;
+					gaiji = gs_EXCLAMATION;
+					break;
+				}
+				break;
+
+			default:
+				script_p--;
+				script_param_read_number_first(gaiji, gs_NOTES);
+				break;
+			}
+			graph_accesspage(1);
+
+			// Still ignoring [text_fx].
+			graph_gaiji_putc(cursor.x, cursor.y, gaiji, text_col);
+
+			cursor_advance_and_animate();
+			continue;
+		}
+#endif
+
+		// Regular kanji
+		kanji.byte[0] = c;
+		c = *script_p;
+		kanji.byte[1] = c;
+		script_p++;
+
+#if (GAME == 5)
+		if(cursor.x == BOX_LEFT) {
+			for(int i = 0; i < colmap_count; i++) {
+				if(colmap.keys[i][0].t == kanji.t) {
+					text_col = colmap.values[i];
+					break;
+				}
+			}
+		}
+#endif
+
+		graph_accesspage((GAME >= 4) ? 1 : 0);
+#if (GAME >= 4)
+		graph_putsa_fx(cursor.x, cursor.y, text_col, kanji.byte);
+#else
+		graph_putsa_fx(cursor.x, cursor.y, (text_col | text_fx), kanji.byte);
+#endif
+		cursor_advance_and_animate();
+
+		// High-level overview, point 3)
+#if (GAME == 3)
+		if(fast_forward) {
+			continue;
+		}
+		if(key_det == INPUT_NONE) {
+			frame_delay(text_interval);
+		} else {
+			int speedup_interval = (text_interval / 3);
+			if((speedup_cycle & 1) || speedup_interval) {
+				if(speedup_interval == 0) {
+					speedup_interval++;
+				}
+				frame_delay(speedup_interval);
+			}
+			speedup_cycle++;
+		}
+#endif
+	}
+#if (GAME <= 4)
+	box_bg_put();
+#endif
+	box_bg.free();
+	bgimage.free();
+}

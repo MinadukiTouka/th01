@@ -1,0 +1,31 @@
+# Build outputs
+dist/
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+_build/
+_stage/
+build/
+
+# Third-party sources fetched separately
+third_party/
+
+# Original game data, fonts, BGM and SE. Never commit or publish these.
+android/app/src/main/assets/th01/
+game-data/
+
+# Signing material
+secrets/
+*.keystore
+*.jks
+keystore.properties
+
+# Local APKs and caches
+*.apk
+*.aab
+*.sha256
+*.log
+*.tmp
+.cache/

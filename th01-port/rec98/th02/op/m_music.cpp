@@ -1,0 +1,815 @@
+#include <mem.h>
+#include "platform/vblank.hpp"
+#include "game/bgimage.hpp"
+#include "libs/master.lib/master.hpp"
+#include "libs/master.lib/pc98_gfx.hpp"
+#include "th01/math/clamp.hpp"
+#include "th01/math/polar.hpp"
+#include "th02/v_colors.hpp"
+#include "th02/hardware/frmdelay.h"
+#include "th02/formats/musiccmt.hpp"
+#if (GAME == 5)
+#include "th05/hardware/input.h"
+#elif (GAME == 4)
+#include "th04/hardware/input.h"
+#elif (GAME == 3)
+#include "th03/hardware/input.h"
+#else
+#include "th02/hardware/input.hpp"
+#endif
+#if (GAME >= 4)
+#include "th01/hardware/grcg.hpp"
+#include "th04/hardware/grppsafx.h"
+#include "th04/snd/snd.h"
+#else
+#include "th01/hardware/grppsafx.h"
+#include "th02/snd/snd.h"
+#endif
+#include "th02/op/m_music.hpp"
+#if (GAME == 5)
+#include "th05/op/piano.hpp"
+#include "th05/shiftjis/fns.hpp"
+#include "th05/shiftjis/music.hpp"
+
+static const shiftjis_t near *near *MUSIC_CHOICES[GAME_COUNT] = {
+	MUSIC_CHOICES_TH01,
+	MUSIC_CHOICES_TH02,
+	MUSIC_CHOICES_TH03,
+	MUSIC_CHOICES_TH04,
+	MUSIC_CHOICES_TH05,
+};
+
+static const char near *near *MUSIC_FILES[GAME_COUNT] = {
+	MUSIC_FILES_TH01,
+	MUSIC_FILES_TH02,
+	MUSIC_FILES_TH03,
+	MUSIC_FILES_TH04,
+	MUSIC_FILES_TH05,
+};
+
+int game_sel = (GAME_COUNT - 1);
+const int TRACK_COUNT[GAME_COUNT] = { 14, 18, 24, 28, 23 };
+#else
+#if (GAME == 4)
+#include "th04/shiftjis/music.hpp"
+#elif (GAME == 3)
+#include "th03/shiftjis/music.hpp"
+#elif (GAME == 2)
+#include "th02/shiftjis/music.hpp"
+#endif
+static const size_t TRACK_COUNT = (
+	sizeof(MUSIC_FILES) / sizeof(MUSIC_FILES[0])
+);
+#endif
+
+// Colors
+// ------
+// The Music Room only redraws text whenever it changes, but fully redraws the
+// B plane on every frame – first by blitting [nopoly_B], then by drawing the
+// polygons on top. This places the following constraints on text colors:
+// 1) Colors 0 or 1 can't be used, because those don't include any of the bits
+//    that can stay constant between frames.
+// 2) The hardware palette colors should be identical regardless of the state
+//    of the lowest bit to make the text show up on top of the polygons. That
+//    is, if a color is 5 *or* 6, hardware colors 5 *and* 6 should be
+//    identical. (TH04 and TH05 rely on this.)
+// 3) TH02, TH03, and TH04 populate [nopoly_B] *after* they've blitted the
+//    constant tracklist, thereby including all of the text pixels in the B
+//    plane. TH02 and TH03 also update [nopoly_B] with the B plane from VRAM
+//    every time they blit a new comment. This allows the tracklist (TH04)
+//    and/or comment colors (TH02/TH03/TH04) to simply be odd, even if 2) would
+//    not apply. In that case, that lowest/least significant bit will always be
+//    set when blitting back [nopoly_B], and the polygons can't affect it.
+//    Together with the other constant color bits, the text then appears on top
+//    of the polygons, and in the defined color. (TH02 and TH03 rely on this.)
+
+static const vc_t COL_TRACKLIST_SELECTED = ((GAME >= 4) ? 3 : V_WHITE);
+static const vc_t COL_TRACKLIST          = ((GAME >= 4) ? 5 : 3);
+static const vc_t COL_CMT_TRACK          = ((GAME >= 4) ? 7 : V_WHITE);
+static const vc_t COL_CMT_COMMENT        = ((GAME >= 4) ? 7 : 13);
+// ------
+
+// Coordinates
+// -----------
+
+static const screen_x_t TRACKLIST_LEFT = ((GAME == 5) ? 12 : 16);
+#if (GAME == 5)
+static const int TRACKLIST_VISIBLE_COUNT = 12;
+
+static const screen_y_t TRACKLIST_TOP = 96;
+static const pixel_t TRACKLIST_H = (TRACKLIST_VISIBLE_COUNT * GLYPH_H);
+
+static const screen_y_t LABEL_GAME_TOP = 32;
+static const screen_y_t LABEL_UP_TOP = (TRACKLIST_TOP - GLYPH_H);
+static const screen_y_t LABEL_DOWN_TOP = (TRACKLIST_TOP + TRACKLIST_H);
+#else
+inline screen_y_t track_top(uint8_t sel) {
+#if (GAME == 4)
+	return (8 + (sel * GLYPH_H));
+#elif (GAME == 3)
+	return (40 + (sel * GLYPH_H));
+#elif (GAME == 2)
+	return ((static_cast<tram_y_t>(sel) + 6) * GLYPH_H);
+#endif
+}
+
+inline int16_t track_fx(vc_t col) {
+	if(GAME >= 4) {
+		return col;
+	} else {
+		return (col | FX_WEIGHT_BOLD);
+	}
+}
+#endif
+
+static const pixel_t CMT_LINE_W = (CMT_LINE_LENGTH * GLYPH_HALF_W);
+static const pixel_t CMT_COMMENT_H = (CMT_COMMENT_LINES * GLYPH_H);
+
+static const screen_x_t CMT_TITLE_LEFT = (
+	/**/ (GAME >= 3)  ? (RES_X - GLYPH_FULL_W - CMT_LINE_W) :
+	/*   (GAME == 2) */ ((RES_X / 2) - (CMT_LINE_W / 2))
+);
+static const screen_y_t CMT_TITLE_TOP = ((GAME == 5) ? 32 : 64);
+
+static const screen_x_t CMT_COMMENT_LEFT = (RES_X - GLYPH_FULL_W - CMT_LINE_W);
+#if (GAME == 5)
+static const screen_y_t CMT_COMMENT_TOP = (PIANO_BOTTOM + 8);
+#else
+static const screen_y_t CMT_COMMENT_TOP = (CMT_TITLE_TOP + GLYPH_H);
+#endif
+
+#if (GAME != 4)
+const LTWH<upixel_t> CMT_TITLE = {
+	CMT_TITLE_LEFT, CMT_TITLE_TOP, CMT_LINE_W, GLYPH_H,
+};
+const LTWH<upixel_t> CMT_COMMENT = {
+	CMT_COMMENT_LEFT, CMT_COMMENT_TOP, CMT_LINE_W, CMT_COMMENT_H,
+};
+#endif
+// -----------
+
+// Polygon state
+// -------------
+
+struct polygon_point_t {
+	pixel_t x;
+	Subpixel y;
+};
+
+static const unsigned int POLYGON_COUNT = 16;
+
+// ZUN quirk: This has to be intentional.
+static const unsigned int POLYGONS_RENDERED = (
+	(GAME == 5) ? (POLYGON_COUNT - 2) : POLYGON_COUNT
+);
+
+bool polygons_initialized = false;
+
+struct polygon_t {
+	polygon_point_t center;
+	polygon_point_t velocity;
+	unsigned char angle;
+	unsigned char angle_speed;
+};
+
+polygon_t polygons[POLYGON_COUNT];
+// -------------
+
+// Selection state
+// ---------------
+
+#if (GAME <= 4)
+uint8_t track_playing = 0;
+#endif
+uint8_t music_sel;
+page_t music_page_accessed;
+// ---------------
+
+// Backgrounds
+// -----------
+
+// Persistent intended contents of the B plane, without any polygons drawn on
+// top of it.
+GrpSurface_M1 nopoly_B;
+// -----------
+
+struct cmt_line_t {
+	shiftjis_t c[CMT_LINE_SIZE];
+};
+cmt_line_t __seg *cmt;
+
+#if (GAME == 5)
+// TH05 selection state
+// --------------------
+
+int track_id_at_top;
+int track_playing;
+int track_count_cur;
+// --------------------
+
+void pascal near track_unput_or_put(uint8_t track_sel, bool16 put)
+{
+	enum {
+		TRACKLIST_RIGHT = (TRACKLIST_LEFT + TRACKLIST_W),
+	};
+
+	const shiftjis_t* choice;
+	vc_t col = COL_TRACKLIST;
+
+	screen_y_t top = ((track_sel - track_id_at_top) * GLYPH_H);
+	if((top < 0) || (top >= TRACKLIST_H)) {
+		return;
+	}
+	top += TRACKLIST_TOP;
+	const screen_y_t bottom = (top + GLYPH_H - 1);
+	if(put) {
+		grcg_setcolor(GC_RMW, COL_TRACKLIST);
+		grcg_hline(TRACKLIST_LEFT, TRACKLIST_RIGHT, top);
+		grcg_hline(TRACKLIST_LEFT, TRACKLIST_RIGHT, bottom);
+		grcg_vline(TRACKLIST_LEFT, top, bottom);
+		grcg_vline(TRACKLIST_RIGHT, top, bottom);
+		grcg_off();
+	} else {
+		bgimage.write_bg_region(TRACKLIST_LEFT, top, TRACKLIST_W, GLYPH_H);
+	}
+	if(track_sel == track_playing) {
+		col = COL_TRACKLIST_SELECTED;
+	}
+
+	choice = MUSIC_CHOICES[game_sel][track_sel];
+	graph_putsa_fx(TRACKLIST_LEFT, top, col, choice);
+}
+
+void pascal near tracklist_put(uint8_t sel)
+{
+	for(int i = 0; i < (track_count_cur + 2); i++) {
+		track_unput_or_put(i, (i == sel));
+	}
+	graph_putsa_fx(TRACKLIST_LEFT, LABEL_UP_TOP, COL_TRACKLIST, LABEL_UP);
+	graph_putsa_fx(
+		TRACKLIST_LEFT, LABEL_DOWN_TOP, COL_TRACKLIST, LABEL_DOWN
+	);
+	graph_putsa_fx(
+		TRACKLIST_LEFT,
+		LABEL_GAME_TOP,
+		COL_TRACKLIST_SELECTED,
+		LABEL_GAME[game_sel]
+	);
+}
+#else
+void pascal near track_put(uint8_t i, vc_t col)
+{
+	graph_putsa_fx(
+		TRACKLIST_LEFT, track_top(i), track_fx(col), MUSIC_CHOICES[i]
+	);
+}
+
+void pascal near tracklist_put(uint8_t sel)
+{
+	for(int i = 0; i < sizeof(MUSIC_CHOICES) / sizeof(MUSIC_CHOICES[0]); i++) {
+		track_put(i, ((i == sel) ? COL_TRACKLIST_SELECTED : COL_TRACKLIST));
+	}
+}
+#endif
+
+void near nopoly_B_snap(void)
+{
+	nopoly_B.snap(0, 0, PL_B);
+}
+
+void near nopoly_B_put(void)
+{
+	nopoly_B.write(PL_B, 0, 0);
+}
+
+void pascal near polygon_init(polygon_t near& p)
+{
+	if(p.velocity.x == 0) {
+		p.velocity.x = 1;
+	}
+	p.velocity.y.v = (to_sp(2.0f) + TO_SP(irand() & 3));
+	p.angle = irand();
+	p.angle_speed = (0x04 - (irand() & 0x07));
+	if(p.angle_speed == 0x00) {
+		p.angle_speed = 0x04;
+	}
+}
+
+void near polygons_update_and_render(void)
+{
+	unsigned int i;
+	polygon_t near *p;
+	if(!polygons_initialized) {
+		for((p = polygons, i = 0); i < POLYGONS_RENDERED; (i++, p++)) {
+			// Carefully preserving the original order of irand() calls...
+			p->center.x = (irand() % RES_X);
+			p->center.y.v = (irand() % to_sp(RES_Y));
+			p->velocity.x = (4 - (irand() & 7));
+			polygon_init(*p);
+		}
+
+		// ZUN quirk: This is never reset.
+		polygons_initialized = true;
+	}
+	for((p = polygons, i = 0); i < POLYGONS_RENDERED; (i++, p++)) {
+		unsigned int j;
+		screen_point_t points[10];
+		const screen_x_t center_x = p->center.x;
+		const screen_y_t center_y = p->center.y.to_pixel();
+		const pixel_t radius = (((i % 4) * 16) + 64);
+		const int point_count = ((i / 4) + 3);
+		for(j = 0; j < point_count; j++) {
+			unsigned char point_angle = (((j << 8) / point_count) + p->angle);
+			points[j].x = polar_x_fast(center_x, radius, point_angle);
+			points[j].y = polar_y_fast(center_y, radius, point_angle);
+		}
+		points[j] = points[0];
+
+		p->center.x += p->velocity.x;
+		p->center.y.v += p->velocity.y.v;
+		p->angle += p->angle_speed;
+		if((p->center.x <= 0) || (p->center.x >= (RES_X - 1))) {
+			p->velocity.x *= -1;
+		}
+
+		// Enough to cover the maximum possible radius of 96.
+		if(p->center.y >= to_sp(RES_Y + 100.0f)) {
+			// Carefully preserving the original order of irand() calls...
+			p->center.x = (irand() % RES_X);
+			p->center.y.set(-100.0f);
+			p->velocity.x = (8 - (irand() & 15));
+			polygon_init(*p);
+		}
+
+		grcg_polygon_c(points, point_count);
+	}
+}
+
+void near music_flip(void)
+{
+#if (GAME <= 4)
+	static uint8_t near music_sel_on_page[PAGE_COUNT];
+	uint8_t music_sel_prev = music_sel_on_page[music_page_accessed];
+
+	if(music_sel != music_sel_prev) {
+		track_put(music_sel_prev, COL_TRACKLIST);
+		track_put(music_sel, COL_TRACKLIST_SELECTED);
+		music_sel_on_page[music_page_accessed] = music_sel;
+	}
+#endif
+
+	frame_delay(1);
+
+	graph_showpage(music_page_accessed);
+	graph_accesspage(music_page_accessed ^= 1);
+}
+
+void near music_update_render_and_flip(void)
+{
+	nopoly_B_put();
+#if (GAME == 5)
+	piano_render();
+#endif
+
+	// Draw the polygons via the GRCG by setting all bits in all tile registers
+	// but restricting blitting to the B plane. Technically, using the GRCG
+	// wouldn't be necessary and is in fact a slower way of regularly writing
+	// pixels to just the B plane, but all master.lib polygon drawing functions
+	// write to VRAM using `=` (MOV) rather than `|=` (OR), and thus expect the
+	// GRCG to be enabled.
+	grcg_setcolor((GC_RMW | GC_B), 0xF);
+	polygons_update_and_render();
+	grcg_off();
+	music_flip();
+}
+
+void pascal near cmt_load(int track)
+{
+#if (GAME == 5)
+	char* FN = "_MUSIC0.TXT";
+
+	FN[6] = ('0' + game_sel);
+	file_ropen(FN);
+#elif (GAME == 4)
+	file_ropen("_MUSIC.TXT");
+#else
+	file_ropen("MUSIC.TXT");
+#endif
+	file_seek((track * CMT_LINES * CMT_LINE_SIZE), SEEK_SET);
+	file_read(cmt, (CMT_LINES * CMT_LINE_SIZE));
+	file_close();
+	for(int i = 0; i < CMT_LINES; i++) {
+		cmt[i].c[CMT_LINE_LENGTH] = '\0';
+	}
+}
+
+void near cmt_unput(void)
+{
+#if (GAME == 4)
+	bgimage.write_bg_region(
+		CMT_TITLE_LEFT, CMT_TITLE_TOP, CMT_LINE_W, (CMT_LINES * GLYPH_H)
+	);
+#else
+	bgimage.write(CMT_TITLE_LEFT, CMT_TITLE_TOP, &CMT_TITLE);
+	bgimage.write(CMT_COMMENT_LEFT, CMT_COMMENT_TOP, &CMT_COMMENT);
+#endif
+}
+
+void near cmt_put(void)
+{
+#if (GAME >= 4)
+	static const int16_t FX = 0;
+#else
+	static const int16_t FX = FX_WEIGHT_HEAVY;
+#endif
+	graph_putsa_fx(
+		CMT_TITLE_LEFT, CMT_TITLE_TOP, (COL_CMT_TRACK | FX), cmt[0].c
+	);
+	const cmt_line_t *cmt_p = &cmt[1];
+	screen_y_t top = CMT_COMMENT_TOP;
+	for(int line = 1; line < CMT_LINES; line++) {
+		if(!((GAME >= 4) && (cmt_p->c[0] == ';'))) {
+			graph_putsa_fx(
+				CMT_COMMENT_LEFT, top, (COL_CMT_COMMENT | FX), cmt_p->c
+			);
+		}
+		top += GLYPH_H;
+		cmt_p++;
+	}
+}
+
+#if (GAME >= 4)
+void pascal near cmt_load_unput_and_put_both_animate(int track)
+{
+	cmt_unput();
+	music_update_render_and_flip();
+	cmt_unput();
+
+	cmt_load(track);
+
+	// Fade in
+	int func; // ACTUAL TYPE: graph_putsa_fx_func_t
+	for(func = FX_MASK; func < FX_MASK_END; func++) {
+		graph_putsa_fx_func = static_cast<graph_putsa_fx_func_t>(func);
+		cmt_put();	music_update_render_and_flip();
+		cmt_put();	music_update_render_and_flip();
+	}
+	graph_putsa_fx_func = FX_WEIGHT_BOLD;
+	cmt_put();	music_update_render_and_flip();
+	cmt_put();
+}
+#else
+void pascal near cmt_unput_and_put(void)
+{
+	nopoly_B_put();
+	cmt_unput();
+	cmt_put();
+}
+#endif
+
+// Input wrappers
+// --------------
+// The Music Room is the only piece of UI that is more or less the same across
+// 4 of the 5 games. Therefore, it makes sense to define these here rather than
+// adding more complexity to the headers.
+
+#if (GAME == 3)
+#define key_det input_sp
+#endif
+
+// Same game-specific branches as in the TH03/TH04/TH05 cutscene system, but
+// with a different, much smaller effect here.
+//
+// ZUN quirk: After processing an input, the Music Room loop wants to prevent
+// held keys from having any effect by spinning in a different loop until all
+// keys have been released. However, due to the different sensing functions,
+// the actual handling of held keys differs depending on the game:
+//
+// • TH02 and TH04 use raw input sensing functions that don't address the
+//   hardware quirk documented in the `Research/HOLDKEY` example. Therefore,
+//   the eventual key release scancode for a held key is not filtered and gets
+//   through to [key_det], breaking the spinning loop despite the key still
+//   being held.
+// • In TH03 and TH05, this eventual key release scancode is accurately
+//   detected and filtered. Thus, held keys truly don't have any effect, but at
+//   the cost of an additional 614.4 µs for every call to this function.
+inline void music_input_sense(void) {
+#if (GAME == 5)
+	input_reset_sense_held();
+#elif (GAME == 4)
+	input_reset_sense();
+#elif (GAME == 3)
+	input_mode_interface();
+#else
+	input_reset_sense();
+#endif
+}
+// --------------
+
+#if (GAME == 5)
+void pascal near tracklist_unput_and_put_both_animate(int sel)
+{
+	bgimage.write_bg_region(0, LABEL_GAME_TOP, CMT_TITLE_LEFT, GLYPH_H);
+	bgimage.write_bg_region(0, TRACKLIST_TOP, CMT_TITLE_LEFT, TRACKLIST_H);
+	tracklist_put(sel);
+	music_update_render_and_flip();
+	bgimage.write_bg_region(0, LABEL_GAME_TOP, CMT_TITLE_LEFT, GLYPH_H);
+	bgimage.write_bg_region(0, TRACKLIST_TOP, CMT_TITLE_LEFT, TRACKLIST_H);
+	tracklist_put(sel);
+}
+
+void track_unput_and_put_both_animate(uint8_t sel_prev, uint8_t sel_new)
+{
+	track_unput_or_put(sel_prev, false);
+	track_unput_or_put(sel_new, true);
+	music_update_render_and_flip();
+	track_unput_or_put(sel_prev, false);
+	track_unput_or_put(sel_new, true);
+}
+
+void game_switch(void)
+{
+	music_sel = 0;
+	track_playing = 0;
+	track_id_at_top = 0;
+	track_count_cur = TRACK_COUNT[game_sel];
+	tracklist_unput_and_put_both_animate(0);
+	snd_kaja_func(KAJA_SONG_FADE, 32);
+	cmt_load_unput_and_put_both_animate(0);
+	snd_load(MUSIC_FILES[game_sel][0], SND_LOAD_SONG);
+	snd_kaja_func(KAJA_SONG_PLAY, 0);
+}
+#endif
+
+void MUSICROOM_DISTANCE musicroom_menu(void)
+{
+#if (GAME == 5)
+	int frame_since_last_input = 0;
+	uint8_t sel_prev;
+	track_id_at_top = 0;
+	track_playing = 0;
+	music_sel = 0;
+	track_count_cur = TRACK_COUNT[game_sel];
+	#define SEL_QUIT track_count_cur
+#else
+	enum {
+		SEL_QUIT = (TRACK_COUNT + 1),
+	};
+	music_sel = track_playing;
+#endif
+
+	// We don't always come here immediately after VSync.
+	vblank_run(vblank_palette_black_and_tram_wipe);
+
+	graph_accesspage(1);
+
+#if (GAME >= 4)
+	GrpSurface_LoadPI(bgimage, &Palettes, "music.pi");
+#else
+	GrpSurface_LoadPI(bgimage, &Palettes, "op3.pi");
+#endif
+	bgimage.write(0, 0);
+	nopoly_B.alloc(RES_X, RES_Y);
+
+#if (GAME == 5)
+	pfend();
+	pfstart("music.dat");
+	piano_setup_and_put_initial();
+	nopoly_B_snap();
+#endif
+	tracklist_put(music_sel);
+#if (GAME == 4)
+	nopoly_B_snap();
+#endif
+	cmt = HMem<cmt_line_t>::alloc(CMT_LINES);
+	cmt_load(track_playing);
+	cmt_put();
+#if (GAME <= 3)
+	nopoly_B_snap();
+#endif
+	graph_copy_page(0);
+	graph_accesspage(music_page_accessed = 1);
+	music_update_render_and_flip();
+	palette_100();
+
+	while(1) {
+		// In TH05, this loop also ignores any ← or → inputs while ↑ or ↓ are
+		// held, and vice versa.
+		// ZUN bloat: None of this `goto` business would have been necessary if
+		// the loop clearly defined its update and render steps. Especially
+		// since it does want to render the polygon animation every frame.
+		while(1) {
+			music_input_sense();
+			if(!key_det) {
+				break;
+			}
+#if (GAME == 5)
+			if(frame_since_last_input >= 24) {
+				if((key_det == INPUT_UP) || (key_det == INPUT_DOWN)) {
+					frame_since_last_input = 20;
+					break;
+				}
+			}
+			frame_since_last_input++;
+#endif
+			music_update_render_and_flip();
+		}
+controls:
+		// ZUN bloat: We already did that for this frame if we came from above,
+		// but not if we came from the `goto` below.
+		music_input_sense();
+
+#if (GAME == 5)
+		if(key_det & INPUT_UP) {
+			sel_prev = music_sel;
+			if(music_sel > 0) {
+				music_sel--;
+				if(music_sel < track_id_at_top) {
+					track_id_at_top = music_sel;
+					tracklist_unput_and_put_both_animate(music_sel);
+
+					// ZUN quirk: This prevents game switches via ← or → , but
+					// only in the very specific case of
+					// 1) the cursor being at the top of the list,
+					// 2) highlighting a track other than the first one of the
+					//    respective game, and
+					// 3) ←/→ being pressed simultaneously with ↑.
+					//    In any other case, ←/→ are processed as expected, and
+					//    override this cursor movement with a game switch.
+					goto skip_processing_of_left_and_right;
+				} else {
+					track_unput_and_put_both_animate(sel_prev, music_sel);
+				}
+			} else {
+				music_sel = SEL_QUIT;
+				track_id_at_top = (
+					SEL_QUIT - (TRACKLIST_VISIBLE_COUNT - 1)
+				);
+				tracklist_unput_and_put_both_animate(SEL_QUIT);
+			}
+		}
+		if(key_det & INPUT_DOWN) {
+			sel_prev = music_sel;
+			if(music_sel < SEL_QUIT) {
+				music_sel++;
+				if(music_sel >= (track_id_at_top + TRACKLIST_VISIBLE_COUNT)) {
+					track_id_at_top = (
+						music_sel - (TRACKLIST_VISIBLE_COUNT - 1)
+					);
+					tracklist_unput_and_put_both_animate(music_sel);
+
+					// Same as the quirk above, applying to the
+					// corresponding very specific case of
+					// 1) the cursor being at the bottom of the list,
+					// 2) highlighting anything except [SEL_QUIT], and
+					// 3) ←/→ being pressed simultaneously with ↓.
+					goto skip_processing_of_left_and_right;
+				} else {
+					track_unput_and_put_both_animate(sel_prev, music_sel);
+				}
+			} else {
+				music_sel = 0;
+				track_id_at_top = 0;
+				tracklist_unput_and_put_both_animate(music_sel);
+			}
+		}
+		if(key_det & INPUT_LEFT) {
+			ring_dec(game_sel, (GAME_COUNT - 1));
+			game_switch();
+		} else if(key_det & INPUT_RIGHT) {
+			ring_inc_ge(game_sel, GAME_COUNT);
+			game_switch();
+		}
+#else
+		if(key_det & (INPUT_UP | INPUT_DOWN)) {
+			int8_t delta = ((key_det & INPUT_UP) ? -1 : +1);
+			ring_step(music_sel, delta, 0, SEL_QUIT);
+
+			// Skip over the empty line
+			if(music_sel == TRACK_COUNT) {
+				music_sel += delta;
+			}
+		}
+#endif
+	skip_processing_of_left_and_right:
+		if(key_det & (INPUT_SHOT | INPUT_OK)) {
+			if(music_sel != SEL_QUIT) {
+#if (GAME >= 4)
+				snd_kaja_func(KAJA_SONG_FADE, 32);
+#else
+				// Avoids the snd_load() landmine in both TH02 and TH03.
+				snd_kaja_func(KAJA_SONG_STOP, 0);
+#endif
+#if (GAME == 5)
+				sel_prev = track_playing;
+				track_playing = music_sel;
+				track_unput_and_put_both_animate(sel_prev, music_sel);
+				cmt_load_unput_and_put_both_animate(music_sel);
+				snd_load(MUSIC_FILES[game_sel][music_sel], SND_LOAD_SONG);
+				snd_kaja_func(KAJA_SONG_PLAY, 0);
+#elif (GAME == 4)
+				track_playing = music_sel;
+				cmt_load_unput_and_put_both_animate(music_sel);
+				snd_load(MUSIC_FILES[music_sel], SND_LOAD_SONG);
+				snd_kaja_func(KAJA_SONG_PLAY, 0);
+#else
+#if (GAME == 3)
+				snd_load(MUSIC_FILES[music_sel], SND_LOAD_SONG);
+#else
+				// Load both the MIDI and PMD versions of the selected track.
+				// Makes sense given that the track continues playing when
+				// leaving the Music Room – changing the music mode in the
+				// Option menu will then play the same selected track.
+				bool midi_active = snd_midi_active;
+				snd_midi_active = snd_midi_possible;
+				snd_load(MUSIC_FILES[music_sel], SND_LOAD_SONG);
+				snd_midi_active = 0;
+				snd_load(MUSIC_FILES[music_sel], SND_LOAD_SONG);
+				snd_midi_active = midi_active;
+#endif
+				snd_kaja_func(KAJA_SONG_PLAY, 0);
+				track_playing = music_sel;
+				cmt_load(music_sel);
+				cmt_unput_and_put();
+
+				// Update [nopoly_B] to match the B plane of the comment we
+				// just blitted into the respective area. Since this buffer is
+				// reblitted every frame, updating it here preserves the lowest
+				// bit of the comment text pixels regardless of the polygons
+				// rendered on top. This allows comment colors to have any odd
+				// value, just like the tracklist colors.
+				nopoly_B.snap(
+					CMT_TITLE_LEFT, CMT_TITLE_TOP, PL_B, &CMT_TITLE
+				);
+				nopoly_B.snap(
+					CMT_COMMENT_LEFT, CMT_COMMENT_TOP, PL_B, &CMT_COMMENT
+				);
+
+				music_update_render_and_flip();
+				cmt_unput_and_put();
+#endif
+			} else {
+				break;
+			}
+		}
+		if(key_det & INPUT_CANCEL) {
+			break;
+		}
+		if(!key_det) {
+#if (GAME == 5)
+			frame_since_last_input = 0;
+#endif
+			music_update_render_and_flip();
+			goto controls;
+		}
+	};
+
+	// Wait until the player released the key that broke out of the loop
+	while(1) {
+		music_input_sense();
+		if(!key_det) {
+#if (GAME >= 4)
+			// palette_black_out() starts with a delay frame, so we can leave
+			// immediately.
+#else
+			// TH03's music_input_sense() takes a while on slower systems and
+			// ZUN immediately wants to clear VRAM. Make sure we only leave
+			// during VBLANK.
+			if(!vblank_in()) {
+				music_flip();
+			}
+#endif
+			break;
+		}
+		music_update_render_and_flip();
+	}
+
+	HMem<cmt_line_t>::free(cmt);
+	cmt = nullptr;
+	nopoly_B.free();
+
+#if (GAME == 5)
+	pfend();
+	pfstart(OP_AND_END_PF_FN);
+#endif
+#if (GAME >= 4)
+	snd_kaja_func(KAJA_SONG_FADE, 16);
+	graph_showpage(0);
+	graph_accesspage(0);
+	palette_black_out(1);
+	snd_load(BGM_MENU_MAIN_FN, SND_LOAD_SONG);
+	snd_kaja_func(KAJA_SONG_PLAY, 0);
+#else
+	graph_showpage(1);
+
+	// ZUN quirk: graph_clear() sets all of VRAM to hardware color #0, which is
+	// purple in the original images, not black.
+	// Since [PaletteTone] also stays at 100, this clear call is not as useless
+	// as it seems. The alternative of setting all other colors to color #0
+	// would even cause additional tearing with TH02's call site code: Its
+	// pi_palette_apply() call is sandwiched between the expensive calls to
+	// pi_load() and pi_put_8(), which would negate any palette tricks.
+	graph_accesspage(1);
+	graph_clear();
+#endif
+}
